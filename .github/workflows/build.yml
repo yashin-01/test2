@@ -2,7 +2,7 @@ name: Build IPA
 on: [push, workflow_dispatch]
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - run: brew install xcodegen ldid && xcodegen generate
