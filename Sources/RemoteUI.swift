@@ -45,20 +45,29 @@ struct RemoteView: View {
     // MARK: acciones
     func press(_ k: RemoteKey) {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        // Encender una TV apagada: Wake-on-LAN (la conexión de control no existe mientras está apagada)
+        // Encender: con la TV apagada no existe conexión de control (cierra a los pocos segundos), solo sirve Wake-on-LAN.
         if k == .power, online != true {
-            let mac = UserDefaults.standard.string(forKey: macKey) ?? ""
-            if !mac.isEmpty {
-                error = "Enviando señal de encendido…"
-                Task { await sendWoL(mac: mac, ip: tv.host); try? await Task.sleep(nanoseconds: 2_500_000_000); if error.hasPrefix("Enviando") { error = "" } }
-                return
-            }
-            error = "La TV no responde. Para encenderla apagada, abre esta pantalla con la TV encendida una vez para que aprenda su MAC (o ponla en ⋯ → Encender (MAC))."
+            let macs = wolMACs(tv.host)
+            if !macs.isEmpty { wake(macs); return }
+            error = "La TV no responde y no tengo su MAC. Ponla en ⋯ → Encender (MAC) (la de Ethernet si usa cable)."
         }
         Task {
             do { try await remote.send(k); error = ""; connectedOK = true; rlog("UI", "\(tv.brand.rawValue) \(tv.host) \(k.rawValue) OK") }
             catch ATVError.notPaired { startPairing() }
-            catch { rlog("UI", "\(tv.brand.rawValue) \(tv.host) \(k.rawValue) FALLO: \(error)"); self.error = "Error: \(error.localizedDescription)" }
+            catch {
+                rlog("UI", "\(tv.brand.rawValue) \(tv.host) \(k.rawValue) FALLO: \(error)")
+                let macs = wolMACs(tv.host)
+                if k == .power, !macs.isEmpty { wake(macs) }      // la TV acababa de apagarse: el estado "en línea" estaba atrasado
+                else { self.error = "Error: \(error.localizedDescription)" }
+            }
+        }
+    }
+    func wake(_ macs: [String]) {
+        error = "Enviando señal de encendido…"
+        Task {
+            await sendWoL(macs: macs, ip: tv.host)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            if error.hasPrefix("Enviando") { error = "" }
         }
     }
     func launch(_ app: AppItem) {
@@ -101,6 +110,11 @@ struct RemoteView: View {
             let auto = UserDefaults.standard.object(forKey: "autoKeyboard") as? Bool ?? true
             if auto && !show.wrappedValue && Date().timeIntervalSince(closed.wrappedValue) > 2 { show.wrappedValue = true }
         }
+    }
+    /// La TV solo entra en "Mis dispositivos" cuando ya está vinculada (o respondió a una tecla).
+    func saveIfNew() {
+        guard !store.tvs.contains(where: { $0.host == tv.host }) else { return }
+        store.tvs.append(tv); rlog("UI", "TV guardada tras vincular: \(tv.host)")
     }
     func saveFav() { UserDefaults.standard.set(try? JSONEncoder().encode(favorites), forKey: favKey) }
     func persistTV() { if let i = store.tvs.firstIndex(where: { $0.id == tv.id }) { store.tvs[i] = tv } }
@@ -270,7 +284,7 @@ struct RemoteView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Toggle("Teclado automático", isOn: $autoKeyboard)
-                    Button { macText = UserDefaults.standard.string(forKey: macKey) ?? ""; askMac = true } label: { Label("Encender (MAC)", systemImage: "power.circle") }
+                    Button { macText = UserDefaults.standard.string(forKey: macKey) ?? ""; askMac = true } label: { Label("Encender (MAC)" + (wolMACs(tv.host).isEmpty ? "" : ": \(wolMACs(tv.host).count) guardada(s)"), systemImage: "power.circle") }
                     Section("Marca (solo si se detectó mal)") {
                         Picker("Marca", selection: $tv.brand) { ForEach(Brand.allCases) { Text($0.rawValue).tag($0) } }
                     }
@@ -278,6 +292,7 @@ struct RemoteView: View {
             }
         }
         .onChange(of: tv.brand) { _ in persistTV(); connectedOK = false; bindKeyboardRequest() }
+        .onChange(of: connectedOK) { if $0 { saveIfNew() } }
         .onAppear {
             if let d = UserDefaults.standard.data(forKey: favKey), let v = try? JSONDecoder().decode([AppItem].self, from: d) { favorites = v }
             bindKeyboardRequest()
@@ -288,6 +303,7 @@ struct RemoteView: View {
             while !Task.isCancelled {
                 let ok = await quickOnline(tv)
                 online = ok
+                if ok, linked { saveIfNew() }
                 if ok { await learnMAC(tv); await (remote as? Warmable)?.warmUp() }
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
@@ -296,11 +312,11 @@ struct RemoteView: View {
         .sheet(isPresented: $showApps) {
             AppPicker(tv: tv) { app in if !favorites.contains(app) { favorites.append(app); saveFav() } }
         }
-        .alert("MAC de la TV (Wi-Fi o Ethernet)", isPresented: $askMac) {
+        .alert("MAC de la TV (la de Ethernet si usa cable)", isPresented: $askMac) {
             TextField("AA:BB:CC:DD:EE:FF", text: $macText).textInputAutocapitalization(.never).autocorrectionDisabled()
             Button("Guardar") { UserDefaults.standard.set(macText.trimmingCharacters(in: .whitespaces), forKey: macKey) }
             Button("Cancelar", role: .cancel) {}
-        } message: { Text("En la TV: Ajustes → Red / Acerca de → Dirección MAC. Sirve para encenderla cuando está apagada.") }
+        } message: { Text("Si la TV usa cable, la MAC de Ethernet es distinta a la de Wi-Fi: mírala en la lista de dispositivos de tu router. Puedes poner varias separadas por coma.") }
         .alert("Código de la TV", isPresented: $askCode) {
             TextField("6 caracteres", text: $code).textInputAutocapitalization(.never)
             Button("Emparejar") { finish() }
