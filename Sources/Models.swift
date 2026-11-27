@@ -72,3 +72,39 @@ final class Store: ObservableObject {
         cache[k] = r; return r
     }
 }
+
+// MARK: Capacidades opcionales por marca
+struct AppItem: Identifiable, Hashable, Codable { var id: String; var name: String }
+
+func jsonStr(_ o: Any) -> String {
+    (try? JSONSerialization.data(withJSONObject: o)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+}
+
+protocol Pairable {
+    var isLinked: Bool { get }
+    var needsCode: Bool { get }
+    func beginPairing() async throws
+    func finishPairing(code: String) async throws
+    func cancelPairing()
+}
+extension Pairable {
+    var needsCode: Bool { true }
+    func finishPairing(code: String) async throws {}
+}
+
+protocol TextCapable {
+    var replacesText: Bool { get }          // true: la TV reemplaza todo el texto (se manda el texto completo)
+    func typeText(_ s: String) async throws
+    func backspace(_ n: Int) async throws
+    func enter() async throws
+}
+extension TextCapable { var replacesText: Bool { false } }
+
+protocol AppLaunchable {
+    var presets: [AppItem] { get }
+    func installedApps() async throws -> [AppItem]
+    func launch(_ app: AppItem) async throws
+}
+protocol PointerCapable { func moveCursor(dx: Int, dy: Int) async throws; func click() async throws }
+protocol Warmable { func warmUp() async }
+protocol TextRequestSource: AnyObject { var onTextRequest: (() -> Void)? { get set } }

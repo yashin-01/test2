@@ -14,7 +14,6 @@ enum ATVError: LocalizedError {
     }
 }
 
-protocol Pairable { func beginPairing() async throws; func finishPairing(code: String) async throws }
 
 // MARK: DER mínimo (certificado autofirmado + lectura de claves RSA)
 enum DER {
@@ -209,7 +208,7 @@ final class TLSChannel {
 }
 
 // MARK: Android TV Remote v2 (Philips Android, Sony/TCL/Hisense/Xiaomi/Google TV...)
-final class AndroidTVRemote: TVRemote, Pairable {
+final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, TextRequestSource, Warmable {
     let host: String
     private var pairing: TLSChannel?
     private var ctl: TLSChannel?
@@ -217,12 +216,63 @@ final class AndroidTVRemote: TVRemote, Pairable {
     init(host: String) { self.host = host }
 
     var paired: Bool { UserDefaults.standard.bool(forKey: "atv.paired.\(host)") }
+    var isLinked: Bool { paired }
+    var onTextRequest: (() -> Void)?
+
+    /// Cancela el emparejamiento en curso: avisa a la TV (status 400) y cierra el canal para que quite el aviso.
+    func cancelPairing() {
+        guard let c = pairing else { return }
+        pairing = nil
+        rlog("ATV", "emparejamiento cancelado por el usuario")
+        Task { try? await c.write(PB.vi(1, 2) + PB.vi(2, 400)); c.conn.cancel() }
+    }
+    func warmUp() async { if paired, ctl == nil { try? await connectControl() } }
+
+    // Texto: se inyectan teclas Android (a-z, 0-9 y algunos signos; sin mayúsculas)
+    private func keyCode(_ ch: Character) -> Int? {
+        guard let a = ch.asciiValue else { return nil }
+        switch a {
+        case 97...122: return 29 + Int(a) - 97
+        case 48...57: return 7 + Int(a) - 48
+        case 32: return 62
+        case 46: return 56
+        case 44: return 55
+        case 45: return 69
+        case 64: return 77
+        case 47: return 76
+        default: return nil
+        }
+    }
+    private func inject(_ code: Int) async throws {
+        if ctl == nil { try await connectControl(); try await Task.sleep(nanoseconds: 800_000_000) }
+        do { try await ctl!.write(PB.ld(10, PB.vi(1, code) + PB.vi(2, 3))) } catch { ctl = nil; listener?.cancel(); throw error }
+    }
+    func typeText(_ s: String) async throws {
+        for ch in s.lowercased() {
+            if let c = keyCode(ch) { try await inject(c) } else { rlog("ATV", "caracter no soportado: \(ch)") }
+        }
+    }
+    func backspace(_ n: Int) async throws { for _ in 0..<n { try await inject(67) } }
+    func enter() async throws { try await inject(66) }
+
+    // Apps (deep link / paquete). La lista de apps instaladas no está disponible en este protocolo.
+    let presets: [AppItem] = [AppItem(id: "https://www.netflix.com/title", name: "Netflix"), AppItem(id: "https://www.youtube.com", name: "YouTube"),
+        AppItem(id: "https://app.primevideo.com", name: "Prime Video"), AppItem(id: "https://www.disneyplus.com", name: "Disney+"),
+        AppItem(id: "https://open.spotify.com", name: "Spotify")]
+    func installedApps() async throws -> [AppItem] { [] }
+    func launch(_ app: AppItem) async throws {
+        if ctl == nil { try await connectControl(); try await Task.sleep(nanoseconds: 800_000_000) }
+        let link = app.id.contains(":") ? app.id : "market://launch?id=\(app.id)"
+        rlog("ATV", "abrir app: \(link)")
+        do { try await ctl!.write(PB.ld(90, PB.str(1, link))) } catch { ctl = nil; listener?.cancel(); throw error }
+    }
     private func outer(_ extra: [UInt8]) -> [UInt8] { PB.vi(1, 2) + PB.vi(2, 200) + extra }
     private func expectOK(_ m: [UInt8]) throws {
         guard PB.parse(m)[2]?.v == 200 else { throw ATVError.protocolError("la TV rechazó el emparejamiento") }
     }
 
     func beginPairing() async throws {
+        cancelPairing()
         let ch = try TLSChannel(host: host, port: 6467)
         try await ch.open(); pairing = ch
         try await ch.write(outer(PB.ld(10, PB.str(1, "atvremote") + PB.str(2, "RemoteHub"))))
@@ -263,6 +313,7 @@ final class AndroidTVRemote: TVRemote, Pairable {
         while !Task.isCancelled {
             guard let m = try? await ch.readMessage() else { break }
             let f = PB.parse(m)
+            if f[22] != nil { rlog("ATV", "la TV pide teclado (ime_show_request)"); DispatchQueue.main.async { self.onTextRequest?() } }
             if f[1] != nil {
                 let info = PB.str(1, "iPhone") + PB.str(2, "RemoteHub") + PB.vi(3, 1) + PB.str(4, "1") + PB.str(5, "com.remotehub.app") + PB.str(6, "1.0")
                 try? await ch.write(PB.ld(1, PB.vi(1, 622) + PB.ld(2, info)))
