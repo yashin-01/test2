@@ -13,6 +13,7 @@ struct ContentView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var disc: Discovery
     @State private var adding = false
+    @State private var path = NavigationPath()
     @State private var online: [UUID: Bool] = [:]
     @State private var renamingID: UUID?
     @State private var newName = ""
@@ -26,7 +27,7 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List {
                 Section("Mis dispositivos") {
                     if store.tvs.isEmpty { Text("Aún no agregas ninguna TV").foregroundStyle(.secondary) }
@@ -47,7 +48,7 @@ struct ContentView: View {
                 }
                 Section("Cerca de ti") {
                     ForEach(nearby) { tv in
-                        Button { store.tvs.append(tv) } label: {
+                        NavigationLink(value: tv) {
                             HStack(spacing: 12) {
                                 Image(systemName: "plus.circle.fill").font(.title3)
                                 VStack(alignment: .leading, spacing: 2) {
@@ -68,7 +69,7 @@ struct ContentView: View {
             }
             .navigationTitle("RemoteHub")
             .navigationDestination(for: TV.self) { RemoteView(tv: $0) }
-            .sheet(isPresented: $adding) { AddView() }
+            .sheet(isPresented: $adding) { AddView { tv in DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { path.append(tv) } } }
             .alert("Renombrar", isPresented: Binding(get: { renamingID != nil }, set: { if !$0 { renamingID = nil } })) {
                 TextField("Nombre", text: $newName)
                 Button("Guardar") {
@@ -85,8 +86,8 @@ struct ContentView: View {
 }
 
 struct AddView: View {
-    @EnvironmentObject var store: Store
     @Environment(\.dismiss) var dismiss
+    let onContinue: (TV) -> Void
     @State private var name = ""; @State private var host = ""; @State private var brand = Brand.androidTV
     var body: some View {
         NavigationStack {
@@ -99,7 +100,7 @@ struct AddView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancelar") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Guardar") { store.tvs.append(TV(name: name.isEmpty ? brand.rawValue : name, host: host, brand: brand)); dismiss() }.disabled(host.isEmpty)
+                    Button("Continuar") { let tv = TV(name: name.isEmpty ? brand.rawValue : name, host: host, brand: brand); dismiss(); onContinue(tv) }.disabled(host.isEmpty)
                 }
             }
         }
