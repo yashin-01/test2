@@ -1,5 +1,7 @@
 name: Build IPA
 on: [push, workflow_dispatch]
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: macos-15
@@ -14,6 +16,14 @@ jobs:
         run: |
           mkdir -p out/Payload && cp -R build/Build/Products/Release-iphoneos/RemoteHub.app out/Payload/
           ldid -SRemoteHub.entitlements out/Payload/RemoteHub.app/RemoteHub
-          (cd out && zip -qr ../RemoteHub-multicast.ipa Payload)
-      - uses: actions/upload-artifact@v4
-        with: {name: RemoteHub-ipa, path: RemoteHub-multicast.ipa}
+          (cd out && zip -qr ../RemoteHub.ipa Payload)
+      # El IPA queda en Releases como archivo suelto (sin .zip): se descarga directo desde el iPhone.
+      - name: Publicar IPA en Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest RemoteHub.ipa \
+            --title "RemoteHub (última compilación)" \
+            --notes "Compilado desde ${GITHUB_SHA::7}. Descarga RemoteHub.ipa y ábrelo con FlareStore / AltStore." \
+            --target "$GITHUB_SHA"
