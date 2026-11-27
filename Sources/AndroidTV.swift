@@ -117,7 +117,9 @@ enum ATVIdentity {
         return (ref as! SecIdentity)
     }
 
+    private static let idLock = NSLock()
     static func identity() throws -> SecIdentity {
+        idLock.lock(); defer { idLock.unlock() }
         if let id = lookup() { return id }
         if let id = restore() { return id }
         rlog("ATV", "creando identidad RSA 2048 + certificado autofirmado")
@@ -181,20 +183,27 @@ final class TLSChannel {
 
     func open() async throws {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+            let lock = NSLock()
             var done = false
             let label = self.label
+            let conn = self.conn
+            // Se resume UNA sola vez, aunque lleguen varios estados a la vez desde hilos distintos
+            let finish: (Error?) -> Void = { err in
+                lock.lock(); let first = !done; done = true; lock.unlock()
+                guard first else { return }
+                if let err = err { conn.cancel(); c.resume(throwing: err) } else { c.resume() }
+            }
             conn.stateUpdateHandler = { s in
                 rlog("ATV", "\(label) estado: \(s)")
-                guard !done else { return }
                 switch s {
-                case .ready: done = true; c.resume()
-                case .failed(let e), .waiting(let e): done = true; c.resume(throwing: e)
-                case .cancelled: done = true; c.resume(throwing: URLError(.timedOut))
+                case .ready: finish(nil)
+                case .failed(let e), .waiting(let e): finish(e)
+                case .cancelled: finish(URLError(.timedOut))
                 default: break
                 }
             }
             conn.start(queue: .global())
-            DispatchQueue.global().asyncAfter(deadline: .now() + 8) { if !done { self.conn.cancel() } }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 8) { finish(URLError(.timedOut)) }
         }
     }
 
@@ -219,6 +228,7 @@ final class TLSChannel {
             len |= Int(b & 0x7f) << shift
             if b & 0x80 == 0 { break }
             shift += 7
+            if shift > 28 { throw ATVError.protocolError("mensaje inválido") }
         }
         let m = try await readBytes(len)
         rlog("ATV", "\(label) <- \(m.count)B campos \(PB.parse(m).keys.sorted())")
@@ -235,34 +245,171 @@ final class TLSChannel {
     }
 }
 
+// MARK: Estado del campo de texto de la TV (lo escribe el hilo de escucha, lo lee la UI)
+struct IMEValues { var ready = false; var imeCounter = 0; var fieldCounter = 0; var text: String? }
+final class IMEState {
+    private let box = Locked(IMEValues())
+    var snapshot: IMEValues { box.get() }
+    func update(_ f: @escaping (inout IMEValues) -> Void) { box.modify { f(&$0) } }
+}
+enum ATVEvent { case tvText(String), textRequest, unpaired }
+
+// MARK: Sesión de control (puerto 6466). Es un actor: todo el estado de la conexión pasa por aquí,
+// una sola conexión, sin accesos simultáneos.
+actor ATVLink {
+    private let host: String
+    private let ime: IMEState
+    private let emit: (ATVEvent) -> Void
+    private var channel: TLSChannel?
+    private var connecting: Task<TLSChannel, Error>?
+    private var listener: Task<Void, Never>?
+
+    init(host: String, ime: IMEState, emit: @escaping (ATVEvent) -> Void) {
+        self.host = host; self.ime = ime; self.emit = emit
+    }
+
+    var isConnected: Bool { channel != nil }
+
+    /// Devuelve siempre un canal vivo. Llamadas simultáneas comparten una única conexión.
+    func ensure() async throws -> TLSChannel {
+        if let c = channel { return c }
+        if let t = connecting { return try await t.value }
+        let t = Task { try await self.openChannel() }
+        connecting = t
+        defer { connecting = nil }
+        return try await t.value
+    }
+
+    private func openChannel() async throws -> TLSChannel {
+        let ch = try TLSChannel(host: host, port: 6466)
+        try await ch.open()
+        channel = ch
+        ime.update { $0 = IMEValues() }
+        listener?.cancel()
+        listener = Task { await self.listen(ch) }
+        try? await Task.sleep(nanoseconds: 700_000_000)   // dar tiempo al saludo inicial
+        return ch
+    }
+
+    /// Escribe con un reintento: si la conexión estaba muerta, se reconecta y se vuelve a enviar.
+    func write(_ m: [UInt8]) async throws {
+        var last: Error = URLError(.networkConnectionLost)
+        for _ in 0..<2 {
+            let ch = try await ensure()
+            do { try await ch.write(m); return }
+            catch { last = error; drop(ch) }
+        }
+        throw last
+    }
+
+    private func drop(_ ch: TLSChannel) {
+        if channel === ch { channel = nil; listener?.cancel(); listener = nil; ime.update { $0.ready = false } }
+        ch.conn.cancel()
+    }
+
+    private func str(_ f: [Int: PB.Field], _ k: Int) -> String {
+        f[k]?.b.flatMap { String(bytes: $0, encoding: .utf8) } ?? ""
+    }
+
+    private func listen(_ ch: TLSChannel) async {
+        var got = 0
+        while !Task.isCancelled {
+            guard let m = try? await ch.readMessage() else { break }
+            got += 1
+            let f = PB.parse(m)
+
+            if let imeData = f[20]?.b {            // la TV informa del campo de texto activo
+                let p = PB.parse(imeData)
+                let app = p[1]?.b.map { PB.parse($0) } ?? [:]
+                let tfs = p[2]?.b.map { PB.parse($0) }
+                let wasReady = ime.snapshot.ready
+                let val = tfs.map { str($0, 2) } ?? ""
+                ime.update { v in
+                    if let c = app[1]?.v { v.imeCounter = c }
+                    v.ready = (tfs != nil)
+                    if let t = tfs { if let fc = t[1]?.v { v.fieldCounter = fc }; v.text = val } else { v.text = nil }
+                }
+                rlog("ATV", "IME recibido: campo \(tfs.map { "\($0.keys.sorted())" } ?? "ninguno")")
+                if tfs != nil {
+                    emit(.tvText(val))
+                    if !wasReady { emit(.textRequest) }     // se enfocó un campo: abrir teclado
+                }
+            }
+            if let showData = f[22]?.b {           // "Usa tu dispositivo para escribir"
+                let t = PB.parse(showData)[2]?.b.map { PB.parse($0) }
+                if let t = t {
+                    let val = str(t, 2)
+                    ime.update { v in v.ready = true; if let fc = t[1]?.v { v.fieldCounter = fc }; v.text = val }
+                    emit(.tvText(val))
+                }
+                rlog("ATV", "la TV pide teclado (ime_show_request, con campo: \(t != nil))")
+                emit(.textRequest)
+            }
+
+            if f[1] != nil {
+                let info = PB.str(1, "iPhone") + PB.str(2, "RemoteHub") + PB.vi(3, 1) + PB.str(4, "1") + PB.str(5, "com.remotehub.app") + PB.str(6, "1.0")
+                try? await ch.write(PB.ld(1, PB.vi(1, 622) + PB.ld(2, info)))
+            } else if f[2] != nil {
+                try? await ch.write(PB.ld(2, PB.vi(1, 622)))
+            } else if let p = f[8]?.b {
+                try? await ch.write(PB.ld(9, PB.vi(1, PB.parse(p)[1]?.v ?? 0)))
+            }
+        }
+        // Solo limpia si ESTA es todavía la conexión activa (un listener viejo ya no borra la nueva)
+        let wasCurrent = (channel === ch)
+        if wasCurrent { channel = nil; listener = nil; ime.update { $0.ready = false } }
+        ch.conn.cancel()
+        if wasCurrent && got == 0 && !Task.isCancelled {
+            rlog("ATV", "la TV cerro sin responder: el emparejamiento ya no es valido, hay que emparejar de nuevo")
+            emit(.unpaired)
+        }
+    }
+}
+
 // MARK: Android TV Remote v2 (Philips Android, Sony/TCL/Hisense/Xiaomi/Google TV...)
 final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, TextRequestSource, TextMirror, Warmable {
     let host: String
-    private var pairing: TLSChannel?
-    private var ctl: TLSChannel?
-    private var listener: Task<Void, Never>?
-    init(host: String) { self.host = host }
+    private let ime = IMEState()
+    private let pairingBox = Locked<TLSChannel?>(nil)
+    private var session: ATVLink!
+    var onTextRequest: (() -> Void)?
+    var onTVText: ((String) -> Void)?
+
+    init(host: String) {
+        self.host = host
+        self.session = ATVLink(host: host, ime: ime) { [weak self] ev in self?.handle(ev) }
+    }
+
+    private func handle(_ ev: ATVEvent) {
+        switch ev {
+        case .tvText(let v): DispatchQueue.main.async { self.onTVText?(v) }
+        case .textRequest: DispatchQueue.main.async { self.onTextRequest?() }
+        case .unpaired: UserDefaults.standard.set(false, forKey: "atv.paired.\(host)")
+        }
+    }
 
     var paired: Bool { UserDefaults.standard.bool(forKey: "atv.paired.\(host)") }
     var isLinked: Bool { paired }
-    var onTextRequest: (() -> Void)?
-    var onTVText: ((String) -> Void)?
-    var tvText: String? { imeText }
-    private var imeCounter = 0
-    private var fieldCounter = 0
-    private var imeText: String?
-    private var imeReady = false
+    var tvText: String? { ime.snapshot.text }
 
-    /// Cancela el emparejamiento en curso: avisa a la TV (status 400) y cierra el canal para que quite el aviso.
-    func cancelPairing() {
-        guard let c = pairing else { return }
-        pairing = nil
-        rlog("ATV", "emparejamiento cancelado por el usuario")
-        Task { try? await c.write(PB.vi(1, 2) + PB.vi(2, 400)); c.conn.cancel() }
+    func warmUp() async { if paired { _ = try? await session.ensure() } }
+
+    // MARK: Teclas
+    private static let codes: [RemoteKey: Int] = [.power: 26, .up: 19, .down: 20, .left: 21, .right: 22, .ok: 23,
+                                                  .back: 4, .home: 3, .volUp: 24, .volDown: 25, .mute: 164]
+    private func inject(_ code: Int) async throws {
+        guard paired else { throw ATVError.notPaired }
+        try await session.write(PB.ld(10, PB.vi(1, code) + PB.vi(2, 3)))
     }
-    func warmUp() async { if paired, ctl == nil { try? await connectControl() } }
+    func send(_ k: RemoteKey) async throws {
+        guard let code = Self.codes[k] else { return }
+        try await inject(code)
+    }
 
-    // Texto: se inyectan teclas Android (a-z, 0-9 y algunos signos; sin mayúsculas)
+    // MARK: Texto
+    // La TV INSERTA lo que se le manda en el campo (no lo reemplaza). Por eso aquí solo se envía lo NUEVO
+    // (la diferencia) y los borrados se hacen con la tecla Borrar. Antes se mandaba el texto completo
+    // en cada letra y la TV lo acumulaba: "h" + "ho" + "hol" + "hola" = "hhoholhola".
     private func keyCode(_ ch: Character) -> Int? {
         guard let a = ch.asciiValue else { return nil }
         switch a {
@@ -277,24 +424,27 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
         default: return nil
         }
     }
-    private func inject(_ code: Int) async throws {
-        if ctl == nil { try await connectControl(); try await Task.sleep(nanoseconds: 800_000_000) }
-        do { try await ctl!.write(PB.ld(10, PB.vi(1, code) + PB.vi(2, 3))) } catch { ctl = nil; listener?.cancel(); throw error }
-    }
-    /// Con campo de texto activo en la TV se usa el canal IME (texto completo, como la app oficial);
-    /// si no, se inyectan teclas sueltas.
-    var replacesText: Bool { imeReady }
+
     private func sendIME(_ s: String) async throws {
-        if ctl == nil { try await connectControl(); try await Task.sleep(nanoseconds: 800_000_000) }
-        let pos = max(0, s.count - 1)
+        let before = ime.snapshot
+        let pos = max(0, s.utf16.count - 1)
         let edit = PB.vi(1, 1) + PB.ld(2, PB.vi(1, pos) + PB.vi(2, pos) + PB.str(3, s))
-        let msg = PB.ld(21, PB.vi(1, imeCounter) + PB.vi(2, fieldCounter) + PB.ld(3, edit))
-        rlog("ATV", "IME enviado: \(s.count) caracteres (contadores \(imeCounter)/\(fieldCounter))")
-        do { try await ctl!.write(msg) } catch { ctl = nil; listener?.cancel(); throw error }
-        imeText = s
+        let msg = PB.ld(21, PB.vi(1, before.imeCounter) + PB.vi(2, before.fieldCounter) + PB.ld(3, edit))
+        rlog("ATV", "IME enviado: \(s.count) caracteres nuevos (contadores \(before.imeCounter)/\(before.fieldCounter))")
+        try await session.write(msg)
+        // Esperar (máx. ~120 ms) a que la TV confirme, así el siguiente envío lleva el contador al día
+        for _ in 0..<8 {
+            try? await Task.sleep(nanoseconds: 15_000_000)
+            let now = ime.snapshot
+            if now.fieldCounter != before.fieldCounter || now.text != before.text { break }
+        }
     }
+
     func typeText(_ s: String) async throws {
-        if imeReady { try await sendIME(s); return }
+        guard paired else { throw ATVError.notPaired }
+        guard !s.isEmpty else { return }
+        _ = try await session.ensure()
+        if ime.snapshot.ready { try await sendIME(s); return }
         rlog("ATV", "sin campo IME activo: se inyectan teclas")
         for ch in s.lowercased() {
             if let c = keyCode(ch) { try await inject(c) } else { rlog("ATV", "caracter no soportado: \(ch)") }
@@ -303,26 +453,35 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
     func backspace(_ n: Int) async throws { for _ in 0..<n { try await inject(67) } }
     func enter() async throws { try await inject(66) }
 
-    // Apps (deep link / paquete). La lista de apps instaladas no está disponible en este protocolo.
+    // MARK: Apps (deep link / paquete). La lista de apps instaladas no está disponible en este protocolo.
     let presets: [AppItem] = [AppItem(id: "https://www.netflix.com/title", name: "Netflix"), AppItem(id: "https://www.youtube.com", name: "YouTube"),
         AppItem(id: "https://app.primevideo.com", name: "Prime Video"), AppItem(id: "https://www.disneyplus.com", name: "Disney+"),
         AppItem(id: "https://open.spotify.com", name: "Spotify")]
     func installedApps() async throws -> [AppItem] { [] }
     func launch(_ app: AppItem) async throws {
-        if ctl == nil { try await connectControl(); try await Task.sleep(nanoseconds: 800_000_000) }
+        guard paired else { throw ATVError.notPaired }
         let link = app.id.contains(":") ? app.id : "market://launch?id=\(app.id)"
         rlog("ATV", "abrir app: \(link)")
-        do { try await ctl!.write(PB.ld(90, PB.str(1, link))) } catch { ctl = nil; listener?.cancel(); throw error }
+        try await session.write(PB.ld(90, PB.str(1, link)))
     }
+
+    // MARK: Emparejamiento (puerto 6467)
     private func outer(_ extra: [UInt8]) -> [UInt8] { PB.vi(1, 2) + PB.vi(2, 200) + extra }
     private func expectOK(_ m: [UInt8]) throws {
         guard PB.parse(m)[2]?.v == 200 else { throw ATVError.protocolError("la TV rechazó el emparejamiento") }
     }
 
+    /// Cancela el emparejamiento en curso: avisa a la TV (status 400) y cierra el canal para que quite el aviso.
+    func cancelPairing() {
+        guard let c = pairingBox.swap(nil) else { return }
+        rlog("ATV", "emparejamiento cancelado por el usuario")
+        Task { try? await c.write(PB.vi(1, 2) + PB.vi(2, 400)); c.conn.cancel() }
+    }
+
     func beginPairing() async throws {
         cancelPairing()
         let ch = try TLSChannel(host: host, port: 6467)
-        try await ch.open(); pairing = ch
+        try await ch.open(); pairingBox.set(ch)
         try await ch.write(outer(PB.ld(10, PB.str(1, "atvremote") + PB.str(2, "RemoteHub"))))
         try expectOK(try await ch.readMessage())
         let enc = PB.vi(1, 3) + PB.vi(2, 6)   // HEXADECIMAL, 6 símbolos
@@ -337,9 +496,10 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
         var cb: [UInt8] = []
         var idx = c.startIndex
         while idx < c.endIndex, let nx = c.index(idx, offsetBy: 2, limitedBy: c.endIndex), let b = UInt8(c[idx..<nx], radix: 16) { cb.append(b); idx = nx }
-        guard let ch = pairing, c.count == 6, cb.count == 3,
+        let pch = pairingBox.get()
+        guard let ch = pch, c.count == 6, cb.count == 3,
               let mine = ATVIdentity.publicKeyDER(), let (cn, ce) = DER.rsaNE(mine), let (sn, se) = DER.rsaNE(ch.box.key)
-        else { rlog("ATV", "finishPairing: datos invalidos (canal \(pairing != nil), largo \(c.count))"); throw ATVError.badCode }
+        else { rlog("ATV", "finishPairing: datos invalidos (canal \(pch != nil), largo \(c.count))"); throw ATVError.badCode }
         var h = SHA256()
         h.update(data: cn + ce + sn + se + Array(cb.dropFirst()))
         let digest = Array(h.finalize())
@@ -347,70 +507,6 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
         try await ch.write(outer(PB.ld(40, PB.ld(1, digest))))
         try expectOK(try await ch.readMessage())
         UserDefaults.standard.set(true, forKey: "atv.paired.\(host)")
-        ch.conn.cancel(); pairing = nil
-    }
-
-    private func connectControl() async throws {
-        guard paired else { throw ATVError.notPaired }
-        imeReady = false
-        let ch = try TLSChannel(host: host, port: 6466)
-        try await ch.open(); ctl = ch
-        listener = Task { [weak self] in await self?.listen(ch) }
-    }
-
-    private func listen(_ ch: TLSChannel) async {
-        var got = 0
-        while !Task.isCancelled {
-            guard let m = try? await ch.readMessage() else { break }
-            got += 1
-            let f = PB.parse(m)
-            if let imeData = f[20]?.b {
-                let ime = PB.parse(imeData)
-                let app = ime[1]?.b.map { PB.parse($0) } ?? [:]
-                let tfs = ime[2]?.b.map { PB.parse($0) }
-                if let c = app[1]?.v { imeCounter = c }
-                imeReady = (tfs != nil)
-                rlog("ATV", "IME recibido: app_info \(app.keys.sorted()) campo \(tfs.map { "\($0.keys.sorted())" } ?? "ninguno")")
-                if let t = tfs {
-                    if let fc = t[1]?.v { fieldCounter = fc }
-                    let val = t[2]?.b.flatMap { String(bytes: $0, encoding: .utf8) } ?? ""
-                    imeText = val
-                    rlog("ATV", "campo de texto activo (contador \(fieldCounter), \(val.count) caracteres)")
-                    DispatchQueue.main.async { self.onTVText?(val) }
-                }
-            }
-            if let showData = f[22]?.b {
-                let t = PB.parse(showData)[2]?.b.map { PB.parse($0) }
-                if let t = t {
-                    imeReady = true
-                    if let fc = t[1]?.v { fieldCounter = fc }
-                    let val = t[2]?.b.flatMap { String(bytes: $0, encoding: .utf8) } ?? ""
-                    imeText = val
-                    DispatchQueue.main.async { self.onTVText?(val) }
-                }
-                rlog("ATV", "la TV pide teclado (ime_show_request, con campo: \(t != nil))")
-                DispatchQueue.main.async { self.onTextRequest?() }
-            }
-            if f[1] != nil {
-                let info = PB.str(1, "iPhone") + PB.str(2, "RemoteHub") + PB.vi(3, 1) + PB.str(4, "1") + PB.str(5, "com.remotehub.app") + PB.str(6, "1.0")
-                try? await ch.write(PB.ld(1, PB.vi(1, 622) + PB.ld(2, info)))
-            } else if f[2] != nil {
-                try? await ch.write(PB.ld(2, PB.vi(1, 622)))
-            } else if let p = f[8]?.b {
-                try? await ch.write(PB.ld(9, PB.vi(1, PB.parse(p)[1]?.v ?? 0)))
-            }
-        }
-        if got == 0 && !Task.isCancelled {
-            UserDefaults.standard.set(false, forKey: "atv.paired.\(host)")
-            rlog("ATV", "la TV cerro sin responder: el emparejamiento ya no es valido, hay que emparejar de nuevo")
-        }
-        ctl = nil
-    }
-
-    func send(_ k: RemoteKey) async throws {
-        if ctl == nil { try await connectControl(); try await Task.sleep(nanoseconds: 800_000_000) }
-        let codes: [RemoteKey: Int] = [.power: 26, .up: 19, .down: 20, .left: 21, .right: 22, .ok: 23, .back: 4, .home: 3, .volUp: 24, .volDown: 25, .mute: 164]
-        do { try await ctl!.write(PB.ld(10, PB.vi(1, codes[k]!) + PB.vi(2, 3))) }
-        catch { ctl = nil; listener?.cancel(); throw error }
+        ch.conn.cancel(); pairingBox.set(nil)
     }
 }

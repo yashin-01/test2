@@ -32,15 +32,29 @@ struct RemoteView: View {
     @State private var acc = CGSize.zero
     @State private var moved = false
     @State private var lastSend = Date.distantPast
+    @State private var lastLaunch = Date.distantPast
+    @State private var askMac = false
+    @State private var macText = ""
 
     private var remote: TVRemote { store.remote(for: tv) }
     private var pairable: Pairable? { remote as? Pairable }
     private var linked: Bool { connectedOK || (pairable?.isLinked ?? false) }
     private var favKey: String { "fav.\(tv.id.uuidString)" }
+    private var macKey: String { "mac.\(tv.host)" }
 
     // MARK: acciones
     func press(_ k: RemoteKey) {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        // Encender una TV apagada: Wake-on-LAN (la conexión de control no existe mientras está apagada)
+        if k == .power, online != true {
+            let mac = UserDefaults.standard.string(forKey: macKey) ?? ""
+            if !mac.isEmpty {
+                error = "Enviando señal de encendido…"
+                Task { await sendWoL(mac: mac, ip: tv.host); try? await Task.sleep(nanoseconds: 2_500_000_000); if error.hasPrefix("Enviando") { error = "" } }
+                return
+            }
+            error = "La TV no responde. Para encenderla apagada, agrega su MAC en ⋯ → Encender (MAC)."
+        }
         Task {
             do { try await remote.send(k); error = ""; connectedOK = true; rlog("UI", "\(tv.brand.rawValue) \(tv.host) \(k.rawValue) OK") }
             catch ATVError.notPaired { startPairing() }
@@ -48,6 +62,8 @@ struct RemoteView: View {
         }
     }
     func launch(_ app: AppItem) {
+        guard Date().timeIntervalSince(lastLaunch) > 1.2 else { return }   // evita ráfagas al tocar muchas veces
+        lastLaunch = Date()
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         Task {
             guard let l = remote as? AppLaunchable else { error = "Esta marca no permite abrir apps"; return }
@@ -75,6 +91,15 @@ struct RemoteView: View {
         Task {
             do { try await pairable?.finishPairing(code: code); connectedOK = true; error = ""; rlog("UI", "emparejado OK \(tv.host)") }
             catch { self.error = "Error: \(error.localizedDescription)" }
+        }
+    }
+    /// La TV avisa cuando hay un campo de texto enfocado ("usa tu dispositivo para escribir"): se abre el teclado solo.
+    /// Se usan Bindings (referencias al estado) en vez de capturar la vista, para que siempre lean el valor actual.
+    func bindKeyboardRequest() {
+        let show = $showKeyboard, closed = $kbClosedAt
+        (remote as? TextRequestSource)?.onTextRequest = {
+            let auto = UserDefaults.standard.object(forKey: "autoKeyboard") as? Bool ?? true
+            if auto && !show.wrappedValue && Date().timeIntervalSince(closed.wrappedValue) > 2 { show.wrappedValue = true }
         }
     }
     func saveFav() { UserDefaults.standard.set(try? JSONEncoder().encode(favorites), forKey: favKey) }
@@ -169,9 +194,38 @@ struct RemoteView: View {
         }.font(.subheadline.bold()).frame(minHeight: 34)
     }
 
+    // Atajos: cuadrícula fija de 3 columnas. No se desliza ni se mueve; el "+" queda siempre al final.
+    private let maxShortcuts = 9
+    private var shortcutSlots: Int { favorites.count + (favorites.count < maxShortcuts ? 1 : 0) }
+    private var shortcutRows: Int { max(1, (shortcutSlots + 2) / 3) }
+    private var shortcutsHeight: CGFloat { CGFloat(shortcutRows) * 44 + CGFloat(shortcutRows - 1) * 10 }
+
+    var shortcuts: some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 10) {
+            ForEach(favorites) { app in
+                Button { launch(app) } label: {
+                    Text(app.name).font(.subheadline.bold()).foregroundStyle(.primary)
+                        .lineLimit(1).minimumScaleFactor(0.7).padding(.horizontal, 8)
+                        .frame(maxWidth: .infinity).frame(height: 44)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.22)))
+                }.buttonStyle(PressStyle())
+                .contextMenu {
+                    Button { editing = app; editName = app.name; editID = app.id } label: { Label("Editar", systemImage: "pencil") }
+                    Button(role: .destructive) { favorites.removeAll { $0 == app }; saveFav() } label: { Label("Quitar atajo", systemImage: "trash") }
+                }
+            }
+            if favorites.count < maxShortcuts {
+                Button { showApps = true } label: {
+                    Image(systemName: "plus").font(.headline).foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity).frame(height: 44).background(Capsule().fill(fill))
+                }.buttonStyle(PressStyle())
+            }
+        }
+    }
+
     var body: some View {
         GeometryReader { geo in
-            let P = min(262, max(180, geo.size.height - 400))
+            let P = min(262, max(150, geo.size.height - 360 - shortcutsHeight))
             VStack(spacing: 14) {
                 statusBar
                     .alert("Editar atajo", isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } })) {
@@ -194,23 +248,7 @@ struct RemoteView: View {
                     Spacer(); volume; Spacer()
                     Button { showKeyboard = true } label: { circleIcon("keyboard") }.buttonStyle(PressStyle())
                 }
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        Button { showApps = true } label: {
-                            Image(systemName: "plus").font(.headline).foregroundStyle(.primary).frame(width: 44, height: 44).background(Circle().fill(fill))
-                        }.buttonStyle(PressStyle())
-                        ForEach(favorites) { app in
-                            Button { launch(app) } label: {
-                                Text(app.name).font(.subheadline.bold()).foregroundStyle(.primary).padding(.horizontal, 16).frame(height: 44)
-                                    .background(Capsule().fill(Color.accentColor.opacity(0.22)))
-                            }.buttonStyle(PressStyle())
-                            .contextMenu {
-                                Button { editing = app; editName = app.name; editID = app.id } label: { Label("Editar", systemImage: "pencil") }
-                                Button(role: .destructive) { favorites.removeAll { $0 == app }; saveFav() } label: { Label("Quitar atajo", systemImage: "trash") }
-                            }
-                        }
-                    }
-                }
+                shortcuts
                 if favorites.isEmpty { Text("Toca + para crear atajos a tus apps").font(.caption).foregroundStyle(.secondary) }
                 if !error.isEmpty { Text(error).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center) }
             }
@@ -232,19 +270,19 @@ struct RemoteView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Toggle("Teclado automático", isOn: $autoKeyboard)
+                    Button { macText = UserDefaults.standard.string(forKey: macKey) ?? ""; askMac = true } label: { Label("Encender (MAC)", systemImage: "power.circle") }
                     Section("Marca (solo si se detectó mal)") {
                         Picker("Marca", selection: $tv.brand) { ForEach(Brand.allCases) { Text($0.rawValue).tag($0) } }
                     }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
         }
-        .onChange(of: tv.brand) { _ in persistTV(); connectedOK = false }
+        .onChange(of: tv.brand) { _ in persistTV(); connectedOK = false; bindKeyboardRequest() }
         .onAppear {
             if let d = UserDefaults.standard.data(forKey: favKey), let v = try? JSONDecoder().decode([AppItem].self, from: d) { favorites = v }
-            if let s = remote as? TextRequestSource {
-                s.onTextRequest = { if autoKeyboard && !showKeyboard && Date().timeIntervalSince(kbClosedAt) > 4 { showKeyboard = true } }
-            }
+            bindKeyboardRequest()
         }
+        .onDisappear { (remote as? TextRequestSource)?.onTextRequest = nil }
         .task(id: tv.brand) {
             online = nil
             while !Task.isCancelled {
@@ -258,6 +296,11 @@ struct RemoteView: View {
         .sheet(isPresented: $showApps) {
             AppPicker(tv: tv) { app in if !favorites.contains(app) { favorites.append(app); saveFav() } }
         }
+        .alert("MAC de la TV (Wi-Fi o Ethernet)", isPresented: $askMac) {
+            TextField("AA:BB:CC:DD:EE:FF", text: $macText).textInputAutocapitalization(.never).autocorrectionDisabled()
+            Button("Guardar") { UserDefaults.standard.set(macText.trimmingCharacters(in: .whitespaces), forKey: macKey) }
+            Button("Cancelar", role: .cancel) {}
+        } message: { Text("En la TV: Ajustes → Red / Acerca de → Dirección MAC. Sirve para encenderla cuando está apagada.") }
         .alert("Código de la TV", isPresented: $askCode) {
             TextField("6 caracteres", text: $code).textInputAutocapitalization(.never)
             Button("Emparejar") { finish() }
