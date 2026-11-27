@@ -63,13 +63,16 @@ struct SonyRemote: TVRemote, AppLaunchable {
 }
 
 // MARK: Philips: JointSpace (1925) para modelos clásicos; si no responde, Android TV Remote v2 (requiere emparejar)
-final class PhilipsRemote: TVRemote, Pairable, TextCapable, AppLaunchable, TextRequestSource, Warmable {
+final class PhilipsRemote: TVRemote, Pairable, TextCapable, AppLaunchable, TextRequestSource, TextMirror, Warmable {
     let host: String
     private let atv: AndroidTVRemote
     init(host: String) { self.host = host; self.atv = AndroidTVRemote(host: host) }
 
     var isLinked: Bool { atv.isLinked }
     var onTextRequest: (() -> Void)? { get { atv.onTextRequest } set { atv.onTextRequest = newValue } }
+    var onTVText: ((String) -> Void)? { get { atv.onTVText } set { atv.onTVText = newValue } }
+    var tvText: String? { atv.tvText }
+    var replacesText: Bool { atv.paired && atv.replacesText }
 
     func send(_ k: RemoteKey) async throws {
         if atv.paired { try await atv.send(k); return }

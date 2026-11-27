@@ -18,9 +18,8 @@ Si tu firmador lo soporta, agrega en project.yml bajo el target:
 Menú principal > "Diagnóstico y log": pruebas de red, de una TV y envío de tecla (Mute x2). El log se guarda en
 el iPhone; usa "Compartir / guardar log" y adjúntalo. No incluye tokens, claves LG ni PSK de Sony (sí IPs y nombres de TV).
 
-## Dos IPAs
-- RemoteHub-multicast.ipa: lleva el entitlement de multicast embebido con ldid. Úsalo si FlareStore lo respeta.
-- RemoteHub.ipa: sin entitlements. Si el primero no instala, usa este (el escaneo de subred reemplaza al SSDP).
+## IPA
+El workflow genera un solo IPA: RemoteHub-multicast.ipa (lleva el entitlement de multicast embebido con ldid; si el firmador no lo respeta, el escaneo de subred lo reemplaza).
 
 ## Control: touchpad, teclado y atajos
 - Touchpad: desliza = flechas (LG: cursor real), toca = OK.
@@ -30,3 +29,7 @@ el iPhone; usa "Compartir / guardar log" y adjúntalo. No incluye tokens, claves
 
 ## Icono
 Sources/Assets.xcassets/AppIcon.appiconset/icon.png (1024x1024). Para cambiarlo, reemplaza ese archivo.
+
+## Teclado (Android TV / Philips)
+Usa el mismo canal de texto que la app oficial de Google (IME). Selecciona primero un campo de texto en la TV.
+El log guarda solo la longitud del texto, no su contenido; aun así, no escribas contraseñas durante las pruebas.

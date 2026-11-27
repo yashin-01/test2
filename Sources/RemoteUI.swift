@@ -22,6 +22,9 @@ struct RemoteView: View {
     @State private var showKeyboard = false
     @State private var kbClosedAt = Date.distantPast
     @State private var showApps = false
+    @State private var editing: AppItem?
+    @State private var editName = ""
+    @State private var editID = ""
     @State private var renaming = false
     @State private var newName = ""
     @State private var favorites: [AppItem] = []
@@ -126,7 +129,7 @@ struct RemoteView: View {
             }.buttonStyle(PressStyle())
         }.frame(width: 262, height: 262)
     }
-    var touchpad: some View {
+    func touchpad(_ h: CGFloat) -> some View {
         let real = remote is PointerCapable
         return ZStack {
             RoundedRectangle(cornerRadius: 32, style: .continuous).fill(fill)
@@ -136,15 +139,15 @@ struct RemoteView: View {
                     .font(.caption).multilineTextAlignment(.center).padding(.horizontal, 24)
             }.foregroundStyle(.secondary)
         }
-        .frame(maxWidth: .infinity).frame(height: 262)
+        .frame(maxWidth: .infinity).frame(height: h)
         .contentShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
         .gesture(DragGesture(minimumDistance: 0).onChanged { padChanged($0) }.onEnded { _ in padEnded() })
     }
     var volume: some View {
         VStack(spacing: 0) {
-            Button { press(.volUp) } label: { Image(systemName: "plus").font(.title2.bold()).foregroundStyle(.primary).frame(width: 64, height: 72).contentShape(Rectangle()) }
+            Button { press(.volUp) } label: { Image(systemName: "plus").font(.title2.bold()).foregroundStyle(.primary).frame(width: 64, height: 62).contentShape(Rectangle()) }
             Capsule().fill(Color.secondary.opacity(0.35)).frame(width: 30, height: 1.5)
-            Button { press(.volDown) } label: { Image(systemName: "minus").font(.title2.bold()).foregroundStyle(.primary).frame(width: 64, height: 72).contentShape(Rectangle()) }
+            Button { press(.volDown) } label: { Image(systemName: "minus").font(.title2.bold()).foregroundStyle(.primary).frame(width: 64, height: 62).contentShape(Rectangle()) }
         }
         .buttonStyle(PressStyle()).background(Capsule().fill(fill)).frame(width: 64)
     }
@@ -167,12 +170,25 @@ struct RemoteView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 20) {
+        GeometryReader { geo in
+            let P = min(262, max(180, geo.size.height - 400))
+            VStack(spacing: 14) {
                 statusBar
+                    .alert("Editar atajo", isPresented: Binding(get: { editing != nil }, set: { if !$0 { editing = nil } })) {
+                        TextField("Nombre", text: $editName)
+                        TextField("Paquete o enlace", text: $editID).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        Button("Guardar") {
+                            let id = editID.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if let e = editing, !id.isEmpty, let i = favorites.firstIndex(of: e) {
+                                favorites[i] = AppItem(id: id, name: editName.isEmpty ? id : editName); saveFav()
+                            }
+                            editing = nil
+                        }
+                        Button("Cancelar", role: .cancel) { editing = nil }
+                    } message: { Text("En Android TV: un paquete (com.xxx.yyy) o un enlace completo.") }
                 HStack { keyButton("power", .power, tint: .red); Spacer(); keyButton("speaker.slash.fill", .mute); Spacer(); keyButton("house.fill", .home) }
                 Picker("", selection: $mode) { Text("Botones").tag(0); Text("Touchpad").tag(1) }.pickerStyle(.segmented)
-                ZStack { if mode == 0 { dpad } else { touchpad } }.frame(maxWidth: .infinity).frame(height: 262)
+                ZStack { if mode == 0 { dpad.scaleEffect(P / 262) } else { touchpad(P) } }.frame(maxWidth: .infinity).frame(height: P)
                 HStack(alignment: .center) {
                     keyButton("arrow.uturn.backward", .back)
                     Spacer(); volume; Spacer()
@@ -188,7 +204,10 @@ struct RemoteView: View {
                                 Text(app.name).font(.subheadline.bold()).foregroundStyle(.primary).padding(.horizontal, 16).frame(height: 44)
                                     .background(Capsule().fill(Color.accentColor.opacity(0.22)))
                             }.buttonStyle(PressStyle())
-                            .contextMenu { Button("Quitar atajo", role: .destructive) { favorites.removeAll { $0 == app }; saveFav() } }
+                            .contextMenu {
+                                Button { editing = app; editName = app.name; editID = app.id } label: { Label("Editar", systemImage: "pencil") }
+                                Button(role: .destructive) { favorites.removeAll { $0 == app }; saveFav() } label: { Label("Quitar atajo", systemImage: "trash") }
+                            }
                         }
                     }
                 }
@@ -196,6 +215,7 @@ struct RemoteView: View {
                 if !error.isEmpty { Text(error).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center) }
             }
             .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .alert("Renombrar", isPresented: $renaming) {
                 TextField("Nombre", text: $newName)
                 Button("Guardar") { if !newName.isEmpty { tv.name = newName; persistTV() } }
@@ -246,21 +266,25 @@ struct RemoteView: View {
     }
 }
 
-// MARK: Teclado: lo que escribes se envía en vivo a la TV
+// MARK: Teclado: se abre solo con el teclado del iPhone y envía en vivo a la TV
 struct KeyboardSheet: View {
     @EnvironmentObject var store: Store
     @Environment(\.dismiss) var dismiss
     let tv: TV
     @State private var text = ""
     @State private var prev = ""
+    @State private var tvText = ""
     @State private var status = ""
     @State private var chain: Task<Void, Never>?
     @FocusState private var focused: Bool
 
-    private var cap: TextCapable? { store.remote(for: tv) as? TextCapable }
+    private var remote: TVRemote { store.remote(for: tv) }
+    private var cap: TextCapable? { remote as? TextCapable }
 
     func sync(_ new: String) {
-        let old = prev; prev = new
+        let old = prev
+        guard new != old else { return }
+        prev = new
         guard let c = cap else { status = "Esta marca no permite escribir desde el iPhone."; return }
         let before = chain
         chain = Task {
@@ -279,27 +303,48 @@ struct KeyboardSheet: View {
         }
     }
 
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 14) {
-                TextField("Escribe aquí y se envía a la TV", text: $text)
-                    .textFieldStyle(.roundedBorder).focused($focused).autocorrectionDisabled().textInputAutocapitalization(.never)
-                    .onChange(of: text) { sync($0) }
-                    .onSubmit { Task { try? await cap?.enter() } }
-                HStack {
-                    Button("Borrar todo") { text = "" }.buttonStyle(.bordered)
-                    Button("Enter / Buscar") { Task { try? await cap?.enter() } }.buttonStyle(.borderedProminent)
-                }
-                Text("Primero selecciona el campo de texto en la TV. En Android TV solo se envían letras minúsculas, números y algunos signos.")
-                    .font(.caption).foregroundStyle(.secondary)
-                if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.red) }
-                Spacer()
-            }
-            .padding().navigationTitle("Teclado")
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Listo") { dismiss() } } }
-            .onAppear { focused = true }
+    func submit() {
+        Task {
+            await chain?.value
+            do { try await cap?.enter(); rlog("KEYBOARD", "enter enviado") }
+            catch { status = "Error: \(error.localizedDescription)"; rlog("KEYBOARD", "\(error)"); return }
+            dismiss()
         }
-        .presentationDetents([.medium, .large])
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Escribir en la TV", systemImage: "keyboard").font(.subheadline.bold())
+                Spacer()
+                Button("Cerrar") { dismiss() }
+            }
+            HStack {
+                TextField("Escribe aquí…", text: $text)
+                    .focused($focused).autocorrectionDisabled().textInputAutocapitalization(.never)
+                    .submitLabel(.search).onSubmit { submit() }
+                    .onChange(of: text) { sync($0) }
+                if !text.isEmpty {
+                    Button { text = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                }
+            }
+            .padding(12).background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color(.tertiarySystemFill)))
+            if remote is TextMirror { Text("En la TV: \(tvText.isEmpty ? "(vacío)" : tvText)").font(.caption).foregroundStyle(.secondary) }
+            Text("Primero selecciona un campo de texto en la TV. La tecla de buscar del teclado envía Enter.")
+                .font(.caption2).foregroundStyle(.secondary)
+            if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.red) }
+        }
+        .padding()
+        .presentationDetents([.height(230)])
+        .onAppear {
+            if let m = remote as? TextMirror {
+                let initial = m.tvText ?? ""
+                prev = initial; text = initial; tvText = initial
+                m.onTVText = { v in tvText = v }
+            }
+        }
+        .onDisappear { (remote as? TextMirror)?.onTVText = nil }
+        .task { try? await Task.sleep(nanoseconds: 400_000_000); focused = true }
     }
 }
 
@@ -345,6 +390,10 @@ struct AppPicker: View {
                 Section("Personalizada (ej. MagisTV, TizenTV…)") {
                     TextField("Nombre", text: $cname)
                     TextField(hint, text: $cid).autocorrectionDisabled().textInputAutocapitalization(.never)
+                    if tv.brand == .androidTV || tv.brand == .philips {
+                        Text("Dónde ver el paquete: en la TV, Ajustes → Apps → Ver todas → elige la app. Suele aparecer bajo la versión. Mantén pulsado un atajo para editarlo.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Button("Agregar atajo") { onAdd(AppItem(id: cid.trimmingCharacters(in: .whitespaces), name: cname.isEmpty ? cid : cname)); dismiss() }
                         .disabled(cid.trimmingCharacters(in: .whitespaces).isEmpty)
                 }

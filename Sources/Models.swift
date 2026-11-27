@@ -108,3 +108,6 @@ protocol AppLaunchable {
 protocol PointerCapable { func moveCursor(dx: Int, dy: Int) async throws; func click() async throws }
 protocol Warmable { func warmUp() async }
 protocol TextRequestSource: AnyObject { var onTextRequest: (() -> Void)? { get set } }
+
+/// Texto actual del campo de la TV (lo que la TV dice que hay escrito) y aviso de cambios
+protocol TextMirror: AnyObject { var tvText: String? { get }; var onTVText: ((String) -> Void)? { get set } }

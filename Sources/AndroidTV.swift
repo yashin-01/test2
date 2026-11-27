@@ -236,7 +236,7 @@ final class TLSChannel {
 }
 
 // MARK: Android TV Remote v2 (Philips Android, Sony/TCL/Hisense/Xiaomi/Google TV...)
-final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, TextRequestSource, Warmable {
+final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, TextRequestSource, TextMirror, Warmable {
     let host: String
     private var pairing: TLSChannel?
     private var ctl: TLSChannel?
@@ -246,6 +246,12 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
     var paired: Bool { UserDefaults.standard.bool(forKey: "atv.paired.\(host)") }
     var isLinked: Bool { paired }
     var onTextRequest: (() -> Void)?
+    var onTVText: ((String) -> Void)?
+    var tvText: String? { imeText }
+    private var imeCounter = 0
+    private var fieldCounter = 0
+    private var imeText: String?
+    private var imeReady = false
 
     /// Cancela el emparejamiento en curso: avisa a la TV (status 400) y cierra el canal para que quite el aviso.
     func cancelPairing() {
@@ -275,7 +281,21 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
         if ctl == nil { try await connectControl(); try await Task.sleep(nanoseconds: 800_000_000) }
         do { try await ctl!.write(PB.ld(10, PB.vi(1, code) + PB.vi(2, 3))) } catch { ctl = nil; listener?.cancel(); throw error }
     }
+    /// Con campo de texto activo en la TV se usa el canal IME (texto completo, como la app oficial);
+    /// si no, se inyectan teclas sueltas.
+    var replacesText: Bool { imeReady }
+    private func sendIME(_ s: String) async throws {
+        if ctl == nil { try await connectControl(); try await Task.sleep(nanoseconds: 800_000_000) }
+        let pos = max(0, s.count - 1)
+        let edit = PB.vi(1, 1) + PB.ld(2, PB.vi(1, pos) + PB.vi(2, pos) + PB.str(3, s))
+        let msg = PB.ld(21, PB.vi(1, imeCounter) + PB.vi(2, fieldCounter) + PB.ld(3, edit))
+        rlog("ATV", "IME enviado: \(s.count) caracteres (contadores \(imeCounter)/\(fieldCounter))")
+        do { try await ctl!.write(msg) } catch { ctl = nil; listener?.cancel(); throw error }
+        imeText = s
+    }
     func typeText(_ s: String) async throws {
+        if imeReady { try await sendIME(s); return }
+        rlog("ATV", "sin campo IME activo: se inyectan teclas")
         for ch in s.lowercased() {
             if let c = keyCode(ch) { try await inject(c) } else { rlog("ATV", "caracter no soportado: \(ch)") }
         }
@@ -332,6 +352,7 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
 
     private func connectControl() async throws {
         guard paired else { throw ATVError.notPaired }
+        imeReady = false
         let ch = try TLSChannel(host: host, port: 6466)
         try await ch.open(); ctl = ch
         listener = Task { [weak self] in await self?.listen(ch) }
@@ -343,7 +364,33 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
             guard let m = try? await ch.readMessage() else { break }
             got += 1
             let f = PB.parse(m)
-            if f[22] != nil || f[20] != nil { rlog("ATV", "la TV pide teclado (ime_show_request)"); DispatchQueue.main.async { self.onTextRequest?() } }
+            if let imeData = f[20]?.b {
+                let ime = PB.parse(imeData)
+                let app = ime[1]?.b.map { PB.parse($0) } ?? [:]
+                let tfs = ime[2]?.b.map { PB.parse($0) }
+                if let c = app[1]?.v { imeCounter = c }
+                imeReady = (tfs != nil)
+                rlog("ATV", "IME recibido: app_info \(app.keys.sorted()) campo \(tfs.map { "\($0.keys.sorted())" } ?? "ninguno")")
+                if let t = tfs {
+                    if let fc = t[1]?.v { fieldCounter = fc }
+                    let val = t[2]?.b.flatMap { String(bytes: $0, encoding: .utf8) } ?? ""
+                    imeText = val
+                    rlog("ATV", "campo de texto activo (contador \(fieldCounter), \(val.count) caracteres)")
+                    DispatchQueue.main.async { self.onTVText?(val) }
+                }
+            }
+            if let showData = f[22]?.b {
+                let t = PB.parse(showData)[2]?.b.map { PB.parse($0) }
+                if let t = t {
+                    imeReady = true
+                    if let fc = t[1]?.v { fieldCounter = fc }
+                    let val = t[2]?.b.flatMap { String(bytes: $0, encoding: .utf8) } ?? ""
+                    imeText = val
+                    DispatchQueue.main.async { self.onTVText?(val) }
+                }
+                rlog("ATV", "la TV pide teclado (ime_show_request, con campo: \(t != nil))")
+                DispatchQueue.main.async { self.onTextRequest?() }
+            }
             if f[1] != nil {
                 let info = PB.str(1, "iPhone") + PB.str(2, "RemoteHub") + PB.vi(3, 1) + PB.str(4, "1") + PB.str(5, "com.remotehub.app") + PB.str(6, "1.0")
                 try? await ch.write(PB.ld(1, PB.vi(1, 622) + PB.ld(2, info)))
