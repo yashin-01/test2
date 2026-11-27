@@ -1,17 +1,29 @@
 import SwiftUI
 
+struct PressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.opacity(configuration.isPressed ? 0.55 : 1).scaleEffect(configuration.isPressed ? 0.93 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
 struct RemoteView: View {
     @EnvironmentObject var store: Store
     @State var tv: TV
+    @AppStorage("autoKeyboard") private var autoKeyboard = true
     @State private var error = ""
     @State private var askCode = false
     @State private var code = ""
     @State private var connectedOK = false
+    @State private var online: Bool? = nil
     @State private var linking = false
     @State private var linkTask: Task<Void, Never>?
     @State private var mode = 0
     @State private var showKeyboard = false
+    @State private var kbClosedAt = Date.distantPast
     @State private var showApps = false
+    @State private var renaming = false
+    @State private var newName = ""
     @State private var favorites: [AppItem] = []
     @State private var last = CGSize.zero
     @State private var acc = CGSize.zero
@@ -63,6 +75,7 @@ struct RemoteView: View {
         }
     }
     func saveFav() { UserDefaults.standard.set(try? JSONEncoder().encode(favorites), forKey: favKey) }
+    func persistTV() { if let i = store.tvs.firstIndex(where: { $0.id == tv.id }) { store.tvs[i] = tv } }
 
     // MARK: touchpad
     private func padChanged(_ v: DragGesture.Value) {
@@ -83,99 +96,145 @@ struct RemoteView: View {
         }
     }
     private func padEnded() {
-        if !moved {
-            if let p = remote as? PointerCapable { Task { try? await p.click() } } else { press(.ok) }
-        }
+        if !moved { if let p = remote as? PointerCapable { Task { try? await p.click() } } else { press(.ok) } }
         last = .zero; acc = .zero; moved = false
     }
 
     // MARK: piezas de UI
-    func round(_ icon: String, _ k: RemoteKey, tint: Color? = nil) -> some View {
-        Button { press(k) } label: {
-            Image(systemName: icon).font(.title3).frame(width: 62, height: 62)
-                .background(.thinMaterial, in: Circle()).foregroundStyle(tint ?? .primary)
-        }
+    private let fill = Color(.tertiarySystemFill)
+
+    func circleIcon(_ icon: String, tint: Color = .primary) -> some View {
+        Image(systemName: icon).font(.system(size: 22, weight: .semibold)).foregroundStyle(tint)
+            .frame(width: 60, height: 60).background(Circle().fill(fill))
     }
-    func arrow(_ icon: String, _ k: RemoteKey) -> some View {
-        Button { press(k) } label: { Image(systemName: icon).font(.title2.bold()).frame(width: 64, height: 64).contentShape(Rectangle()) }
+    func keyButton(_ icon: String, _ k: RemoteKey, tint: Color = .primary) -> some View {
+        Button { press(k) } label: { circleIcon(icon, tint: tint) }.buttonStyle(PressStyle())
+    }
+    func zone(_ icon: String, _ k: RemoteKey) -> some View {
+        Button { press(k) } label: {
+            Image(systemName: icon).font(.system(size: 24, weight: .bold)).foregroundStyle(.primary)
+                .frame(width: 80, height: 60).contentShape(Rectangle())
+        }.buttonStyle(PressStyle()).padding(8)
     }
     var dpad: some View {
         ZStack {
-            Circle().fill(.thinMaterial).frame(width: 232, height: 232)
-            VStack { arrow("chevron.up", .up); Spacer(); arrow("chevron.down", .down) }.frame(height: 224)
-            HStack { arrow("chevron.left", .left); Spacer(); arrow("chevron.right", .right) }.frame(width: 224)
-            Button { press(.ok) } label: { Text("OK").font(.headline).frame(width: 88, height: 88).background(.tint.opacity(0.25), in: Circle()) }
-        }
+            Circle().fill(fill)
+            VStack { zone("chevron.up", .up); Spacer(); zone("chevron.down", .down) }
+            HStack { zone("chevron.left", .left); Spacer(); zone("chevron.right", .right) }
+            Button { press(.ok) } label: {
+                Text("OK").font(.headline).foregroundStyle(.white).frame(width: 96, height: 96).background(Circle().fill(Color.accentColor))
+            }.buttonStyle(PressStyle())
+        }.frame(width: 262, height: 262)
     }
     var touchpad: some View {
         let real = remote is PointerCapable
         return ZStack {
-            RoundedRectangle(cornerRadius: 28).fill(.thinMaterial)
-            VStack(spacing: 6) {
-                Image(systemName: "hand.point.up.left").font(.largeTitle)
-                Text(real ? "Cursor real: desliza para mover, toca para hacer clic" : "Desliza = flechas (sigue deslizando para recorrer listas) · Toca = OK")
-                    .font(.caption).multilineTextAlignment(.center).padding(.horizontal)
+            RoundedRectangle(cornerRadius: 32, style: .continuous).fill(fill)
+            VStack(spacing: 8) {
+                Image(systemName: "hand.point.up.left.fill").font(.system(size: 34))
+                Text(real ? "Cursor real: desliza para mover, toca para hacer clic" : "Desliza = flechas (sigue deslizando para recorrer listas)\nToca = OK")
+                    .font(.caption).multilineTextAlignment(.center).padding(.horizontal, 24)
             }.foregroundStyle(.secondary)
         }
-        .frame(height: 280)
+        .frame(maxWidth: .infinity).frame(height: 262)
+        .contentShape(RoundedRectangle(cornerRadius: 32, style: .continuous))
         .gesture(DragGesture(minimumDistance: 0).onChanged { padChanged($0) }.onEnded { _ in padEnded() })
     }
+    var volume: some View {
+        VStack(spacing: 0) {
+            Button { press(.volUp) } label: { Image(systemName: "plus").font(.title2.bold()).foregroundStyle(.primary).frame(width: 64, height: 72).contentShape(Rectangle()) }
+            Capsule().fill(Color.secondary.opacity(0.35)).frame(width: 30, height: 1.5)
+            Button { press(.volDown) } label: { Image(systemName: "minus").font(.title2.bold()).foregroundStyle(.primary).frame(width: 64, height: 72).contentShape(Rectangle()) }
+        }
+        .buttonStyle(PressStyle()).background(Capsule().fill(fill)).frame(width: 64)
+    }
     var statusBar: some View {
-        HStack {
-            if linked {
-                Label("Conectado", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.subheadline.bold())
-            } else if linking {
-                ProgressView(); Text("Esperando a la TV…").font(.subheadline)
-                Button("Cancelar", role: .cancel) { cancelPairing() }.buttonStyle(.bordered)
-            } else if pairable != nil {
+        HStack(spacing: 10) {
+            if linking {
+                ProgressView(); Text("Esperando a la TV…").foregroundStyle(.secondary)
+                Button("Cancelar") { cancelPairing() }.buttonStyle(.bordered)
+            } else if online == nil {
+                ProgressView(); Text("Comprobando…").foregroundStyle(.secondary)
+            } else if online == false {
+                Label("Sin conexión", systemImage: "wifi.slash").foregroundStyle(.orange)
+            } else if linked || pairable == nil {
+                Label("Conectado", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            } else {
                 Button("Emparejar con la TV") { startPairing() }.buttonStyle(.borderedProminent)
             }
             Spacer()
-            Menu {
-                Picker("Marca", selection: $tv.brand) { ForEach(Brand.allCases) { Text($0.rawValue).tag($0) } }
-            } label: { Label(tv.brand.rawValue, systemImage: "gearshape") .font(.footnote) }
-        }
+        }.font(.subheadline.bold()).frame(minHeight: 34)
     }
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 18) {
+            VStack(spacing: 20) {
                 statusBar
-                HStack { round("power", .power, tint: .red); Spacer(); round("speaker.slash.fill", .mute); Spacer(); round("house.fill", .home) }
+                HStack { keyButton("power", .power, tint: .red); Spacer(); keyButton("speaker.slash.fill", .mute); Spacer(); keyButton("house.fill", .home) }
                 Picker("", selection: $mode) { Text("Botones").tag(0); Text("Touchpad").tag(1) }.pickerStyle(.segmented)
-                if mode == 0 { dpad } else { touchpad }
-                HStack(spacing: 22) {
-                    round("arrow.uturn.backward", .back)
-                    VStack(spacing: 10) { round("speaker.plus.fill", .volUp); round("speaker.minus.fill", .volDown) }
-                    VStack(spacing: 10) {
-                        Button { showKeyboard = true } label: { Label("Teclado", systemImage: "keyboard").frame(maxWidth: .infinity) }
-                        Button { showApps = true } label: { Label("Atajos", systemImage: "plus.app").frame(maxWidth: .infinity) }
-                    }.buttonStyle(.bordered).frame(maxWidth: 140)
+                ZStack { if mode == 0 { dpad } else { touchpad } }.frame(maxWidth: .infinity).frame(height: 262)
+                HStack(alignment: .center) {
+                    keyButton("arrow.uturn.backward", .back)
+                    Spacer(); volume; Spacer()
+                    Button { showKeyboard = true } label: { circleIcon("keyboard") }.buttonStyle(PressStyle())
                 }
-                if !favorites.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack {
-                            ForEach(favorites) { app in
-                                Button(app.name) { launch(app) }.buttonStyle(.borderedProminent).tint(.indigo)
-                                    .contextMenu { Button("Quitar atajo", role: .destructive) { favorites.removeAll { $0 == app }; saveFav() } }
-                            }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        Button { showApps = true } label: {
+                            Image(systemName: "plus").font(.headline).foregroundStyle(.primary).frame(width: 44, height: 44).background(Circle().fill(fill))
+                        }.buttonStyle(PressStyle())
+                        ForEach(favorites) { app in
+                            Button { launch(app) } label: {
+                                Text(app.name).font(.subheadline.bold()).foregroundStyle(.primary).padding(.horizontal, 16).frame(height: 44)
+                                    .background(Capsule().fill(Color.accentColor.opacity(0.22)))
+                            }.buttonStyle(PressStyle())
+                            .contextMenu { Button("Quitar atajo", role: .destructive) { favorites.removeAll { $0 == app }; saveFav() } }
                         }
                     }
                 }
-                if !error.isEmpty { Text(error).font(.caption).foregroundStyle(.red) }
-            }.padding()
+                if favorites.isEmpty { Text("Toca + para crear atajos a tus apps").font(.caption).foregroundStyle(.secondary) }
+                if !error.isEmpty { Text(error).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center) }
+            }
+            .padding()
+            .alert("Renombrar", isPresented: $renaming) {
+                TextField("Nombre", text: $newName)
+                Button("Guardar") { if !newName.isEmpty { tv.name = newName; persistTV() } }
+                Button("Cancelar", role: .cancel) {}
+            }
         }
-        .navigationTitle(tv.name).navigationBarTitleDisplayMode(.inline)
-        .onChange(of: tv.brand) { _ in
-            if let i = store.tvs.firstIndex(where: { $0.id == tv.id }) { store.tvs[i] = tv }
-            connectedOK = false
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Button { newName = tv.name; renaming = true } label: {
+                    HStack(spacing: 5) { Text(tv.name).font(.headline); Image(systemName: "pencil").font(.caption) }.foregroundStyle(.primary)
+                }.buttonStyle(.plain)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Toggle("Teclado automático", isOn: $autoKeyboard)
+                    Section("Marca (solo si se detectó mal)") {
+                        Picker("Marca", selection: $tv.brand) { ForEach(Brand.allCases) { Text($0.rawValue).tag($0) } }
+                    }
+                } label: { Image(systemName: "ellipsis.circle") }
+            }
         }
+        .onChange(of: tv.brand) { _ in persistTV(); connectedOK = false }
         .onAppear {
             if let d = UserDefaults.standard.data(forKey: favKey), let v = try? JSONDecoder().decode([AppItem].self, from: d) { favorites = v }
-            if let s = remote as? TextRequestSource { s.onTextRequest = { showKeyboard = true } }
+            if let s = remote as? TextRequestSource {
+                s.onTextRequest = { if autoKeyboard && !showKeyboard && Date().timeIntervalSince(kbClosedAt) > 4 { showKeyboard = true } }
+            }
         }
-        .task { await (remote as? Warmable)?.warmUp() }
-        .sheet(isPresented: $showKeyboard) { KeyboardSheet(tv: tv) }
+        .task(id: tv.brand) {
+            online = nil
+            while !Task.isCancelled {
+                let ok = await quickOnline(tv)
+                online = ok
+                if ok { await (remote as? Warmable)?.warmUp() }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
+        .sheet(isPresented: $showKeyboard, onDismiss: { kbClosedAt = Date() }) { KeyboardSheet(tv: tv) }
         .sheet(isPresented: $showApps) {
             AppPicker(tv: tv) { app in if !favorites.contains(app) { favorites.append(app); saveFav() } }
         }

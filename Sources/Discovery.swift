@@ -2,39 +2,86 @@ import Foundation
 import Network
 import Darwin
 
-/// Descubrimiento en 3 capas: Bonjour + SSDP (multicast) + escaneo unicast de la subred.
-/// Si iOS bloquea el multicast (sin entitlement), el escaneo unicast cubre la misma función.
+func tcpOpen(_ ip: String, _ port: UInt16, timeout: Double = 0.8) async -> Bool {
+    await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+        let conn = NWConnection(host: NWEndpoint.Host(ip), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        let lock = NSLock(); var done = false
+        func finish(_ ok: Bool) {
+            lock.lock(); defer { lock.unlock() }
+            if done { return }; done = true; conn.cancel(); c.resume(returning: ok)
+        }
+        conn.stateUpdateHandler = { s in
+            switch s { case .ready: finish(true); case .failed, .waiting: finish(false); default: break }
+        }
+        conn.start(queue: .global())
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(false) }
+    }
+}
+
+/// ¿La TV está encendida y accesible? (algún puerto de control abierto)
+func quickOnline(_ tv: TV) async -> Bool {
+    let ports: [UInt16]
+    switch tv.brand {
+    case .roku: ports = [8060]
+    case .samsung: ports = [8001, 8002]
+    case .lg: ports = [3001, 3000]
+    case .sony: ports = [80]
+    case .philips: ports = [6466, 1925, 1926]
+    case .androidTV: ports = [6466]
+    case .ir: ports = [80]
+    }
+    return await withTaskGroup(of: Bool.self) { g -> Bool in
+        for p in ports { g.addTask { await tcpOpen(tv.host, p) } }
+        for await ok in g { if ok { g.cancelAll(); return true } }
+        return false
+    }
+}
+
+/// Descubrimiento: Bonjour + SSDP + escaneo de subred. Todo candidato pasa por identify(),
+/// que consulta la propia TV (API de Roku, Samsung, Philips, Sony…) para saber marca y nombre.
 final class Discovery: ObservableObject {
     @Published var found: [TV] = []
     @Published var scanning = false
     private var browsers: [NWBrowser] = []
+    private var seen = Set<String>()
+    private var hints: [String: (String?, Brand?)] = [:]
+    private let seenLock = NSLock()
     let types = ["_androidtvremote2._tcp", "_airplay._tcp", "_googlecast._tcp", "_samsungmsf._tcp", "_philipstv_s_rpc._tcp", "_philipstv_h_rpc._tcp"]
 
     func start() {
-        stop(); scanning = true
+        stop(); scanning = true; found = []
+        resetState()
         for t in types {
             let b = NWBrowser(for: .bonjour(type: t, domain: nil), using: .tcp)
             b.stateUpdateHandler = { s in rlog("BONJOUR", "\(t) estado: \(s)") }
             b.browseResultsChangedHandler = { [weak self] results, _ in
                 rlog("BONJOUR", "\(t): \(results.count) servicios")
-                for r in results { if case let .service(name, _, _, _) = r.endpoint { self?.resolve(r.endpoint, name: name, type: t) } }
+                for r in results {
+                    guard case let .service(name, _, _, _) = r.endpoint else { continue }
+                    var md = "", fn = ""
+                    if case let .bonjour(txt) = r.metadata { md = txt.dictionary["md"] ?? ""; fn = txt.dictionary["fn"] ?? "" }
+                    self?.resolve(r.endpoint, svcName: name, md: md, fn: fn)
+                }
             }
             b.start(queue: .global()); browsers.append(b)
         }
         DispatchQueue.global().async { [weak self] in self?.ssdp() }
-        Task { await self.scanSubnet(); await MainActor.run { self.scanning = false } }
+        Task {
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            await self.scanSubnet()
+            await MainActor.run { self.scanning = false }
+        }
     }
     func stop() { browsers.forEach { $0.cancel() }; browsers = [] }
 
-    private func add(_ ip: String, _ name: String, _ brand: Brand) {
-        DispatchQueue.main.async {
-            if let i = self.found.firstIndex(where: { $0.host == ip }) {
-                if brand == .philips { self.found[i].brand = .philips }
-            } else { rlog("DISC", "nuevo \(ip) \(brand.rawValue) '\(name)'"); self.found.append(TV(name: name, host: ip, brand: brand)) }
-        }
+    private func resetState() { seenLock.lock(); seen.removeAll(); hints.removeAll(); seenLock.unlock() }
+    private func setHint(_ ip: String, _ name: String?, _ brand: Brand?) { seenLock.lock(); hints[ip] = (name, brand); seenLock.unlock() }
+    private func claim(_ ip: String) -> (Bool, (String?, Brand?)) {
+        seenLock.lock(); defer { seenLock.unlock() }
+        return (seen.insert(ip).inserted, hints[ip] ?? (nil, nil))
     }
 
-    private func brandFrom(_ s: String) -> Brand? {
+    func brandFrom(_ s: String) -> Brand? {
         let n = s.lowercased()
         if n.contains("philips") { return .philips }
         if n.contains("roku") { return .roku }
@@ -44,8 +91,68 @@ final class Discovery: ObservableObject {
         return nil
     }
 
+    private func xmlTag(_ n: String, _ s: String) -> String? {
+        guard let a = s.range(of: "<\(n)>"), let b = s.range(of: "</\(n)>", range: a.upperBound..<s.endIndex) else { return nil }
+        let v = String(s[a.upperBound..<b.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? nil : v.replacingOccurrences(of: "&amp;", with: "&")
+    }
+    private func jsonObj(_ s: String) -> [String: Any]? { try? JSONSerialization.jsonObject(with: Data(s.utf8)) as? [String: Any] }
+
+    // MARK: identificación de marca y nombre
+    func identify(_ ip: String, hintName: String?, hintBrand: Brand?) async -> TV? {
+        var opened = Set<UInt16>()
+        await withTaskGroup(of: (UInt16, Bool).self) { g in
+            for p in [UInt16(8060), 8001, 3000, 3001, 1925, 1926, 6466] { g.addTask { (p, await tcpOpen(ip, p)) } }
+            for await (p, ok) in g where ok { opened.insert(p) }
+        }
+        guard !opened.isEmpty else { return nil }
+
+        if opened.contains(8060) {
+            var n = hintName ?? "Roku"
+            if let r = try? await httpFull("GET", "http://\(ip):8060/query/device-info") {
+                n = xmlTag("friendly-device-name", r.1) ?? xmlTag("user-device-name", r.1) ?? xmlTag("model-name", r.1) ?? n
+            }
+            return TV(name: n, host: ip, brand: .roku)
+        }
+        if opened.contains(8001) {
+            var n = hintName ?? "Samsung TV"
+            if let r = try? await httpFull("GET", "http://\(ip):8001/api/v2/"), let j = jsonObj(r.1),
+               let d = j["device"] as? [String: Any], let nm = d["name"] as? String { n = nm }
+            return TV(name: n, host: ip, brand: .samsung)
+        }
+        if opened.contains(3001) || (opened.contains(3000) && hintBrand == .lg) {
+            return TV(name: hintName ?? "LG TV", host: ip, brand: .lg)
+        }
+        if opened.contains(1925) || opened.contains(1926) || hintBrand == .philips {
+            for url in ["https://\(ip):1926/6/system", "http://\(ip):1925/6/system", "http://\(ip):1925/1/system"] {
+                if let r = try? await httpFull("GET", url), r.0 == 200, let j = jsonObj(r.1), let n = j["name"] as? String {
+                    return TV(name: hintName ?? "Philips \(n)", host: ip, brand: .philips)
+                }
+            }
+            if hintBrand == .philips { return TV(name: hintName ?? "Philips TV", host: ip, brand: .philips) }
+        }
+        if opened.contains(6466) {
+            let body = Data(#"{"method":"getInterfaceInformation","id":1,"params":[],"version":"1.0"}"#.utf8)
+            if let r = try? await httpFull("POST", "http://\(ip)/sony/system", body: body, headers: ["Content-Type": "application/json"]),
+               r.0 == 200, let j = jsonObj(r.1), let res = (j["result"] as? [Any])?.first as? [String: Any] {
+                let m = (res["modelName"] as? String) ?? "BRAVIA"
+                return TV(name: hintName ?? "Sony \(m)", host: ip, brand: .androidTV)
+            }
+            return TV(name: hintName ?? "Android TV (\(ip))", host: ip, brand: .androidTV)
+        }
+        return nil
+    }
+
+    func identifyAndAdd(_ ip: String) async {
+        let (isNew, h) = claim(ip)
+        guard isNew else { return }
+        guard let tv = await identify(ip, hintName: h.0, hintBrand: h.1) else { return }
+        rlog("DISC", "\(tv.host) -> \(tv.brand.rawValue) '\(tv.name)'")
+        await MainActor.run { self.found.append(tv) }
+    }
+
     // MARK: Bonjour
-    private func resolve(_ ep: NWEndpoint, name: String, type: String) {
+    private func resolve(_ ep: NWEndpoint, svcName: String, md: String, fn: String) {
         let p = NWParameters.tcp
         (p.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options)?.version = .v4
         let c = NWConnection(to: ep, using: p)
@@ -54,8 +161,9 @@ final class Discovery: ObservableObject {
             case .ready:
                 if case let .hostPort(h, _)? = c.currentPath?.remoteEndpoint {
                     var ip = "\(h)"; if let i = ip.firstIndex(of: "%") { ip = String(ip[..<i]) }
-                    let b = self?.brandFrom(name) ?? (type.contains("androidtvremote2") ? .androidTV : .roku)
-                    self?.add(ip, name, b)
+                    let label = fn.isEmpty ? (md.isEmpty ? nil : md) : fn
+                    self?.setHint(ip, label, self?.brandFrom(md + " " + fn + " " + svcName))
+                    Task { await self?.identifyAndAdd(ip) }
                 }
                 c.cancel()
             case .failed: c.cancel()
@@ -100,7 +208,8 @@ final class Discovery: ObservableObject {
             let ip = String(cString: ipBuf); count += 1
             let server = text.components(separatedBy: "\r\n").first(where: { $0.lowercased().hasPrefix("server:") }) ?? ""
             rlog("SSDP", "respuesta de \(ip) \(server)")
-            if let b = brandFrom(text) { add(ip, b.rawValue, b) }
+            setHint(ip, nil, brandFrom(text))
+            Task { await self.identifyAndAdd(ip) }
         }
         rlog("SSDP", "fin: \(count) respuestas")
         return (sent, "", count)
@@ -123,38 +232,29 @@ final class Discovery: ObservableObject {
         return nil
     }
     func ipString(_ v: UInt32) -> String { "\(v >> 24).\((v >> 16) & 255).\((v >> 8) & 255).\(v & 255)" }
-
-    func portOpen(_ ip: String, _ port: UInt16) async -> Bool {
-        await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
-            let conn = NWConnection(host: NWEndpoint.Host(ip), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
-            let lock = NSLock(); var done = false
-            func finish(_ ok: Bool) {
-                lock.lock(); defer { lock.unlock() }
-                if done { return }; done = true; conn.cancel(); c.resume(returning: ok)
-            }
-            conn.stateUpdateHandler = { s in
-                switch s { case .ready: finish(true); case .failed, .waiting: finish(false); default: break }
-            }
-            conn.start(queue: .global())
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.8) { finish(false) }
-        }
-    }
+    func portOpen(_ ip: String, _ port: UInt16) async -> Bool { await tcpOpen(ip, port) }
 
     func scanSubnet() async {
         guard let me = localIPv4() else { rlog("SCAN", "sin IPv4 en en0"); return }
         let base = me & 0xFFFF_FF00
         rlog("SCAN", "escaneando \(ipString(base)).0/24 desde \(ipString(me))")
-        let ports: [(UInt16, Brand)] = [(8060, .roku), (8001, .samsung), (3000, .lg), (1925, .philips), (6466, .androidTV)]
+        let ports: [UInt16] = [8060, 8001, 3001, 1925, 1926, 6466]
         for start in stride(from: 1, to: 255, by: 24) {
             await withTaskGroup(of: Void.self) { g in
                 for h in start..<min(start + 24, 255) {
                     let addr = base | UInt32(h); if addr == me { continue }
                     let ip = ipString(addr)
-                    for (port, brand) in ports {
-                        g.addTask { if await self.portOpen(ip, port) { self.add(ip, "\(brand.rawValue) \(ip)", brand) } }
+                    g.addTask {
+                        let hit = await withTaskGroup(of: Bool.self) { pg -> Bool in
+                            for p in ports { pg.addTask { await tcpOpen(ip, p, timeout: 0.6) } }
+                            for await ok in pg { if ok { pg.cancelAll(); return true } }
+                            return false
+                        }
+                        if hit { await self.identifyAndAdd(ip) }
                     }
                 }
             }
         }
+        rlog("SCAN", "terminado")
     }
 }

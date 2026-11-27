@@ -27,3 +27,6 @@ el iPhone; usa "Compartir / guardar log" y adjúntalo. No incluye tokens, claves
 - Teclado: botón "Teclado". Roku, LG, Samsung y Android TV/Philips (emparejado). Sony e IR no.
 - Atajos: botón "Atajos". Lista las apps de la TV en Roku, LG, Samsung y Sony; en Android TV se usa paquete o enlace.
 - "Conectado" aparece cuando la TV ya está vinculada. Al cancelar el emparejamiento se cierra el canal y se avisa a la TV.
+
+## Icono
+Sources/Assets.xcassets/AppIcon.appiconset/icon.png (1024x1024). Para cambiarlo, reemplaza ese archivo.

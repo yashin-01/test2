@@ -84,6 +84,32 @@ enum PB {
 enum ATVIdentity {
     static let tag = "com.remotehub.atv.identity"
 
+    // Respaldo en archivo: el emparejamiento sobrevive a re-firmas (si el Keychain se pierde, se restaura desde aquí)
+    private static var dir: URL {
+        let u = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("atv", isDirectory: true)
+        try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
+        return u
+    }
+    static func save(priv: SecKey, cert: Data) {
+        var e: Unmanaged<CFError>?
+        if let k = SecKeyCopyExternalRepresentation(priv, &e) as Data? {
+            try? k.write(to: dir.appendingPathComponent("key.der")); try? cert.write(to: dir.appendingPathComponent("cert.der"))
+            rlog("ATV", "identidad respaldada en archivo")
+        }
+    }
+    static func restore() -> SecIdentity? {
+        guard let kd = try? Data(contentsOf: dir.appendingPathComponent("key.der")),
+              let cd = try? Data(contentsOf: dir.appendingPathComponent("cert.der")) else { return nil }
+        var e: Unmanaged<CFError>?
+        let ka: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeRSA, kSecAttrKeyClass as String: kSecAttrKeyClassPrivate]
+        guard let key = SecKeyCreateWithData(kd as CFData, ka as CFDictionary, &e), let cert = SecCertificateCreateWithData(nil, cd as CFData) else { return nil }
+        let kq: [CFString: Any] = [kSecClass: kSecClassKey, kSecValueRef: key, kSecAttrApplicationTag: Data(tag.utf8), kSecAttrIsPermanent: true]
+        let cq: [CFString: Any] = [kSecClass: kSecClassCertificate, kSecValueRef: cert, kSecAttrLabel: tag]
+        _ = SecItemAdd(kq as CFDictionary, nil); _ = SecItemAdd(cq as CFDictionary, nil)
+        rlog("ATV", "identidad restaurada desde archivo")
+        return lookup()
+    }
+
     static func lookup() -> SecIdentity? {
         let q: [CFString: Any] = [kSecClass: kSecClassIdentity, kSecAttrLabel: tag, kSecReturnRef: true, kSecMatchLimit: kSecMatchLimitOne]
         var r: CFTypeRef?
@@ -93,6 +119,7 @@ enum ATVIdentity {
 
     static func identity() throws -> SecIdentity {
         if let id = lookup() { return id }
+        if let id = restore() { return id }
         rlog("ATV", "creando identidad RSA 2048 + certificado autofirmado")
         let attrs: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits as String: 2048,
             kSecPrivateKeyAttrs as String: [kSecAttrIsPermanent as String: true, kSecAttrApplicationTag as String: Data(tag.utf8)]]
@@ -112,6 +139,7 @@ enum ATVIdentity {
         let addQ: [CFString: Any] = [kSecClass: kSecClassCertificate, kSecValueRef: c, kSecAttrLabel: tag]
         let st = SecItemAdd(addQ as CFDictionary, nil)
         rlog("ATV", "certificado guardado en Keychain: OSStatus \(st)")
+        save(priv: priv, cert: Data(cert))
         guard let id = lookup() else { throw ATVError.protocolError("identidad no encontrada en Keychain") }
         return id
     }
@@ -310,10 +338,12 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
     }
 
     private func listen(_ ch: TLSChannel) async {
+        var got = 0
         while !Task.isCancelled {
             guard let m = try? await ch.readMessage() else { break }
+            got += 1
             let f = PB.parse(m)
-            if f[22] != nil { rlog("ATV", "la TV pide teclado (ime_show_request)"); DispatchQueue.main.async { self.onTextRequest?() } }
+            if f[22] != nil || f[20] != nil { rlog("ATV", "la TV pide teclado (ime_show_request)"); DispatchQueue.main.async { self.onTextRequest?() } }
             if f[1] != nil {
                 let info = PB.str(1, "iPhone") + PB.str(2, "RemoteHub") + PB.vi(3, 1) + PB.str(4, "1") + PB.str(5, "com.remotehub.app") + PB.str(6, "1.0")
                 try? await ch.write(PB.ld(1, PB.vi(1, 622) + PB.ld(2, info)))
@@ -322,6 +352,10 @@ final class AndroidTVRemote: TVRemote, Pairable, TextCapable, AppLaunchable, Tex
             } else if let p = f[8]?.b {
                 try? await ch.write(PB.ld(9, PB.vi(1, PB.parse(p)[1]?.v ?? 0)))
             }
+        }
+        if got == 0 && !Task.isCancelled {
+            UserDefaults.standard.set(false, forKey: "atv.paired.\(host)")
+            rlog("ATV", "la TV cerro sin responder: el emparejamiento ya no es valido, hay que emparejar de nuevo")
         }
         ctl = nil
     }
