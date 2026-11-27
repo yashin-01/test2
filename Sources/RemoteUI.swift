@@ -53,7 +53,7 @@ struct RemoteView: View {
                 Task { await sendWoL(mac: mac, ip: tv.host); try? await Task.sleep(nanoseconds: 2_500_000_000); if error.hasPrefix("Enviando") { error = "" } }
                 return
             }
-            error = "La TV no responde. Para encenderla apagada, agrega su MAC en ⋯ → Encender (MAC)."
+            error = "La TV no responde. Para encenderla apagada, abre esta pantalla con la TV encendida una vez para que aprenda su MAC (o ponla en ⋯ → Encender (MAC))."
         }
         Task {
             do { try await remote.send(k); error = ""; connectedOK = true; rlog("UI", "\(tv.brand.rawValue) \(tv.host) \(k.rawValue) OK") }
@@ -288,7 +288,7 @@ struct RemoteView: View {
             while !Task.isCancelled {
                 let ok = await quickOnline(tv)
                 online = ok
-                if ok { await (remote as? Warmable)?.warmUp() }
+                if ok { await learnMAC(tv); await (remote as? Warmable)?.warmUp() }
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
